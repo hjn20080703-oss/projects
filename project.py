@@ -8,6 +8,7 @@ from pathlib import Path
 
 import arcade
 import pytiled_parser
+from pyglet.math import Vec2
 
 # --- Display ---
 SCREEN_WIDTH = 1000
@@ -18,6 +19,8 @@ FULLSCREEN = True
 # --- Camera ---
 VIEWPORT_MARGIN = 200
 CAMERA_SPEED = 0.1
+WORLD_VIEWPORT_WIDTH = 256
+WORLD_VIEWPORT_HEIGHT = 192
 
 # --- Movement ---
 TILE_SIZE = 32
@@ -27,8 +30,16 @@ JUMP_TILES = 2
 JUMP_DISTANCE = TILE_SIZE * JUMP_TILES
 JUMP_DURATION = 0.22
 JUMP_VISUAL_LIFT = 12
-NUM_LEVELS = 6
+NUM_LEVELS = 5
 WALK_FRAME_DURATION = 0.15
+ENEMY_IMAGE = "nobody.png"
+ENEMY_SCALE = 1.0
+ENEMY_SPEED = 2.5
+ENEMY_DETECTION_RANGE = 240
+ENEMY_SPAWN_COUNT = 3
+# Hidden-in-bush: keep the player faintly visible to the user,
+# while enemies treat the player as not detectable.
+STEALTH_ALPHA = 90
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SPRITE_SHEET = "mc and some materials.png"
@@ -46,6 +57,7 @@ LEVEL_MAP_FILES = {
 DEFAULT_LEVEL_MAP = "level1.json"
 TILED_TILESET_FILE = "tilset1.json"
 SAVE_FILE = "savegame.json"
+SAVE_SLOTS = 3
 
 MENU_ITEMS = ("Start", "Continue", "Leave")
 
@@ -101,15 +113,24 @@ def load_character_textures():
 CHAR_WALK_TEXTURES, CHAR_IDLE_TEXTURES = load_character_textures()
 
 
-def save_file_path():
-    return Path(SCRIPT_DIR) / SAVE_FILE
+def save_file_path(slot: int | None = None):
+    """
+    Save slot files live next to the game script.
+    - slot=None keeps legacy path `savegame.json`
+    - slot=1..SAVE_SLOTS uses `savegame_slot{slot}.json`
+    """
+    if slot is None:
+        return Path(SCRIPT_DIR) / SAVE_FILE
+    return Path(SCRIPT_DIR) / f"savegame_slot{int(slot)}.json"
 
 
-def has_save_data():
-    return save_file_path().is_file()
+def has_save_data(slot: int | None = None):
+    if slot is None:
+        return save_file_path().is_file()
+    return save_file_path(slot).is_file()
 
 
-def save_game(level, player_x, player_y, facing, map_file):
+def save_game(level, player_x, player_y, facing, map_file, slot: int = 1):
     data = {
         "level": level,
         "player_x": player_x,
@@ -117,16 +138,42 @@ def save_game(level, player_x, player_y, facing, map_file):
         "facing": facing,
         "map_file": map_file,
     }
-    with save_file_path().open("w", encoding="utf-8") as f:
+    with save_file_path(slot).open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
-def load_save_data():
-    path = save_file_path()
+def load_save_data(slot: int = 1):
+    """
+    Load save data from a given slot.
+    Also supports legacy `savegame.json` by treating it as slot 1 if the new file doesn't exist yet.
+    """
+    path = save_file_path(slot)
+    if not path.is_file() and int(slot) == 1:
+        legacy = save_file_path()
+        if legacy.is_file():
+            path = legacy
     if not path.is_file():
         return None
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def any_slot_has_save_data():
+    if has_save_data():
+        return True
+    for i in range(1, SAVE_SLOTS + 1):
+        if has_save_data(i):
+            return True
+    return False
+
+
+def slot_summary(slot: int):
+    data = load_save_data(slot)
+    if not data:
+        return None
+    level = int(data.get("level", 1))
+    map_file = data.get("map_file", DEFAULT_LEVEL_MAP)
+    return {"level": level, "map_file": map_file}
 
 
 def build_tile_catalog(tiled_map):
@@ -197,7 +244,7 @@ def make_map_sprite(image_file, px, py, tile_size):
     return sprite
 
 
-def load_tiled_map(map_filename, fallback_w, fallback_h):
+def load_tiled_map(map_filename, fallback_w, fallback_h, level_number: int = 1):
     """
     Load a Tiled JSON map (e.g. level1.json) exactly as exported from Tiled Editor.
     """
@@ -256,18 +303,20 @@ def load_tiled_map(map_filename, fallback_w, fallback_h):
             if not image_file:
                 continue
 
-            blocks = image_file in BLOCKING_TILE_IMAGES
+            is_bush = image_file == "Bush.png"
+            is_mountain = image_file == "Mountain.png"
+            is_blocking_tile = image_file in BLOCKING_TILE_IMAGES
             px, py = tile_to_pixel(tx, ty, min_tx, max_ty, tile_size)
 
             if is_mountain_layer:
-                if image_file == "Mountain.png":
+                if is_mountain:
                     mountain_list.append(make_map_sprite(image_file, px, py, tile_size))
                     hitbox = arcade.Sprite(
                         "Grass.png", 0.01, center_x=px, center_y=py
                     )
                     hitbox.alpha = 0
                     wall_list.append(hitbox)
-                elif blocks:
+                elif is_blocking_tile and not (level_number == 1 and is_bush):
                     sprite = make_map_sprite(image_file, px, py, tile_size)
                     mountain_list.append(sprite)
                     wall_list.append(sprite)
@@ -275,7 +324,14 @@ def load_tiled_map(map_filename, fallback_w, fallback_h):
                     floor_list.append(make_map_sprite(image_file, px, py, tile_size))
                     if image_file == "Grass.png":
                         walkable_grass.append((px, py))
-            elif blocks:
+            elif is_bush:
+                # Level 1: bushes are enterable; after entering, player can hide.
+                sprite = make_map_sprite(image_file, px, py, tile_size)
+                bush_list.append(sprite)
+                if is_blocking_tile and level_number != 1:
+                    wall_list.append(sprite)
+            elif is_blocking_tile:
+                # Fallback for other blocking tiles (currently expected: only Bush/Mountain).
                 sprite = make_map_sprite(image_file, px, py, tile_size)
                 bush_list.append(sprite)
                 wall_list.append(sprite)
@@ -380,7 +436,7 @@ class MenuView(arcade.View):
         items = []
         for i, label in enumerate(MENU_ITEMS):
             enabled = True
-            if label == "Continue" and not has_save_data():
+            if label == "Continue" and not any_slot_has_save_data():
                 enabled = False
             items.append(
                 (label, cx, base_y - i * spacing, btn_w, btn_h, enabled)
@@ -473,11 +529,9 @@ class MenuView(arcade.View):
     def _activate_selection(self):
         label = MENU_ITEMS[self.selected_index]
         if label == "Start":
-            self.window.show_view(GameView())
+            self.window.show_view(SaveSlotsView(mode="new"))
         elif label == "Continue":
-            saved = load_save_data()
-            if saved:
-                self.window.show_view(GameView(saved_state=saved))
+            self.window.show_view(SaveSlotsView(mode="load"))
         elif label == "Leave":
             self.window.close()
 
@@ -507,9 +561,10 @@ class MenuView(arcade.View):
 class GameView(arcade.View):
     """Main gameplay."""
 
-    def __init__(self, saved_state=None):
+    def __init__(self, saved_state=None, save_slot: int = 1):
         super().__init__()
         self.saved_state = saved_state
+        self.save_slot = int(save_slot)
         self.current_level = 1
         self.current_map_file = DEFAULT_LEVEL_MAP
         self.floor_list = None
@@ -536,6 +591,17 @@ class GameView(arcade.View):
         self.jump_target_x = 0.0
         self.jump_target_y = 0.0
 
+        self.enemy_list = None
+        self.player_hidden = False
+
+        # Direction key "held" state (so jump won't cancel movement).
+        self.hold_up = False
+        self.hold_down = False
+        self.hold_left = False
+        self.hold_right = False
+        self.input_change_x = 0
+        self.input_change_y = 0
+
         self.camera_sprites = None
         self.camera_gui = None
 
@@ -553,13 +619,17 @@ class GameView(arcade.View):
                 self.player_sprite.texture = CHAR_IDLE_TEXTURES[facing]
             self.saved_state = None
             self.scroll_to_player(immediate=True)
+            self._update_player_stealth()
         else:
             self.load_level(self.current_level)
+            self._update_player_stealth()
 
     def _init_cameras(self):
         w, h = self.window.width, self.window.height
         self.camera_sprites = arcade.Camera(w, h)
         self.camera_gui = arcade.Camera(w, h)
+        # Keep scale at 1 — arcade's Camera.scale breaks easily; zoom via viewport below.
+        self.camera_sprites.scale = 1.0
 
     def load_level(self, level_number):
         self.current_level = level_number
@@ -579,7 +649,7 @@ class GameView(arcade.View):
                 spawn_x,
                 spawn_y,
                 self.current_map_file,
-            ) = load_tiled_map(map_file, fw, fh)
+            ) = load_tiled_map(map_file, fw, fh, level_number=level_number)
         except (FileNotFoundError, ValueError) as err:
             self.floor_list = arcade.SpriteList()
             self.bush_list = arcade.SpriteList()
@@ -599,6 +669,13 @@ class GameView(arcade.View):
             self.player_sprite, self.wall_list
         )
 
+        # Reset stealth + enemies for each level.
+        self.player_hidden = False
+        self.player_sprite.alpha = 255
+        self.enemy_list = arcade.SpriteList()
+        if self.current_level == 1:
+            self._spawn_enemies_level1(spawn_x, spawn_y)
+
         self.view_left = 0
         self.view_bottom = 0
         self.scroll_to_player(immediate=True)
@@ -614,6 +691,25 @@ class GameView(arcade.View):
         self.walk_frame = 0
         self.walk_timer = 0.0
         self.is_jumping = False
+        self.player_sprite.alpha = 255
+
+    def _recompute_input_vector(self):
+        self.input_change_x = 0
+        self.input_change_y = 0
+
+        if self.hold_up and not self.hold_down:
+            self.input_change_y = PLAYER_MOVEMENT_SPEED
+        elif self.hold_down and not self.hold_up:
+            self.input_change_y = -PLAYER_MOVEMENT_SPEED
+
+        if self.hold_left and not self.hold_right:
+            self.input_change_x = -PLAYER_MOVEMENT_SPEED
+        elif self.hold_right and not self.hold_left:
+            self.input_change_x = PLAYER_MOVEMENT_SPEED
+
+    def _apply_movement_from_input(self):
+        self.player_sprite.change_x = self.input_change_x
+        self.player_sprite.change_y = self.input_change_y
 
     def _jump_destination_clear(self, target_x, target_y):
         """Return True if the landing tile does not overlap walls."""
@@ -639,6 +735,7 @@ class GameView(arcade.View):
         if not self._jump_destination_clear(target_x, target_y):
             return
 
+        # Temporarily override physics movement; we will restore after landing.
         self.player_sprite.change_x = 0
         self.player_sprite.change_y = 0
         self.is_jumping = True
@@ -670,6 +767,79 @@ class GameView(arcade.View):
             self.is_jumping = False
             self.player_sprite.center_x = self.jump_target_x
             self.player_sprite.center_y = self.jump_target_y
+            # If you were still holding movement keys, resume walking immediately.
+            self._apply_movement_from_input()
+
+    def _update_player_stealth(self):
+        """Level 1: being inside bush hides the player from enemies."""
+        if self.current_level != 1 or not self.bush_list:
+            if self.player_hidden:
+                self.player_hidden = False
+                self.player_sprite.alpha = 255
+            return
+
+        in_bush = len(arcade.check_for_collision_with_list(self.player_sprite, self.bush_list)) > 0
+        if in_bush and not self.player_hidden:
+            self.player_hidden = True
+            self.player_sprite.alpha = STEALTH_ALPHA
+        elif not in_bush and self.player_hidden:
+            self.player_hidden = False
+            self.player_sprite.alpha = 255
+
+    def _spawn_enemies_level1(self, spawn_x: float, spawn_y: float):
+        """Spawn a few enemies near the player's spawn point."""
+        enemy_texture = ENEMY_IMAGE
+        if not (Path(SCRIPT_DIR) / ENEMY_IMAGE).is_file():
+            # Avoid crashing if enemy texture isn't exported to png yet.
+            print(
+                f"Warning: cannot locate '{ENEMY_IMAGE}' in {SCRIPT_DIR}. "
+                f"Using placeholder texture 'Grass.png' for enemies."
+            )
+            enemy_texture = "Grass.png"
+
+        offsets = [
+            (5, 0),
+            (-5, 0),
+            (0, 5),
+            (0, -5),
+            (3, 3),
+            (-3, 3),
+            (3, -3),
+            (-3, -3),
+        ]
+        enemies_spawned = 0
+
+        for ox, oy in offsets:
+            if enemies_spawned >= ENEMY_SPAWN_COUNT:
+                break
+
+            ex = spawn_x + ox * TILE_SIZE
+            ey = spawn_y + oy * TILE_SIZE
+
+            # Clamp inside map bounds.
+            ex = max(0, min(ex, self.map_pixel_width))
+            ey = max(0, min(ey, self.map_pixel_height))
+
+            probe = arcade.Sprite(
+                enemy_texture,
+                ENEMY_SCALE,
+                center_x=ex,
+                center_y=ey,
+            )
+            # Avoid spawning inside walls or on top of the player.
+            if len(arcade.check_for_collision_with_list(probe, self.wall_list)) > 0:
+                continue
+            if arcade.check_for_collision(probe, self.player_sprite):
+                continue
+
+            enemy = arcade.Sprite(
+                enemy_texture,
+                ENEMY_SCALE,
+                center_x=ex,
+                center_y=ey,
+            )
+            self.enemy_list.append(enemy)
+            enemies_spawned += 1
 
     def _update_player_texture(self, delta_time):
         """Cycle walk frames for the current facing direction."""
@@ -706,6 +876,8 @@ class GameView(arcade.View):
             self.floor_list.draw()
         if self.bush_list:
             self.bush_list.draw()
+        if self.enemy_list:
+            self.enemy_list.draw()
         if self.player_list:
             self.player_list.draw()
         if self.mountain_list:
@@ -731,6 +903,7 @@ class GameView(arcade.View):
             self.player_sprite.center_y,
             self.facing,
             self.current_map_file,
+            slot=self.save_slot,
         )
 
     def on_key_press(self, key, modifiers):
@@ -743,82 +916,300 @@ class GameView(arcade.View):
             self._start_jump()
             return
 
-        if self.is_jumping:
-            return
-
         if arcade.key.KEY_1 <= key <= arcade.key.KEY_1 + NUM_LEVELS - 1:
+            if self.is_jumping:
+                return
             new_level = key - arcade.key.KEY_1 + 1
             if new_level != self.current_level:
                 self.load_level(new_level)
             return
 
+        # Direction keys update held input even while jumping.
         if key in (arcade.key.UP, arcade.key.W):
-            self.facing = "up"
-            self.player_sprite.change_y = PLAYER_MOVEMENT_SPEED
+            self.hold_up = True
+            if not self.is_jumping:
+                self.facing = "up"
         elif key in (arcade.key.DOWN, arcade.key.S):
-            self.facing = "down"
-            self.player_sprite.change_y = -PLAYER_MOVEMENT_SPEED
+            self.hold_down = True
+            if not self.is_jumping:
+                self.facing = "down"
         elif key in (arcade.key.LEFT, arcade.key.A):
-            self.facing = "left"
-            self.player_sprite.change_x = -PLAYER_MOVEMENT_SPEED
+            self.hold_left = True
+            if not self.is_jumping:
+                self.facing = "left"
         elif key in (arcade.key.RIGHT, arcade.key.D):
-            self.facing = "right"
-            self.player_sprite.change_x = PLAYER_MOVEMENT_SPEED
+            self.hold_right = True
+            if not self.is_jumping:
+                self.facing = "right"
+        else:
+            return
+
+        self._recompute_input_vector()
+        if not self.is_jumping:
+            self._apply_movement_from_input()
 
     def on_key_release(self, key, modifiers):
+        released = False
         if key in (arcade.key.UP, arcade.key.W):
-            self.player_sprite.change_y = 0
+            self.hold_up = False
+            released = True
         elif key in (arcade.key.DOWN, arcade.key.S):
-            self.player_sprite.change_y = 0
+            self.hold_down = False
+            released = True
         elif key in (arcade.key.LEFT, arcade.key.A):
-            self.player_sprite.change_x = 0
+            self.hold_left = False
+            released = True
         elif key in (arcade.key.RIGHT, arcade.key.D):
-            self.player_sprite.change_x = 0
+            self.hold_right = False
+            released = True
+
+        if not released:
+            return
+
+        self._recompute_input_vector()
+        if not self.is_jumping:
+            self._apply_movement_from_input()
 
     def on_update(self, delta_time):
         if self.is_jumping:
             self._update_jump(delta_time)
             self._update_player_texture(delta_time)
+            self._update_player_stealth()
+            self._update_enemies(delta_time)
             self.scroll_to_player()
             return
 
+        # Apply held-direction input continuously (prevents "stuck" movement).
+        self._recompute_input_vector()
+        self._apply_movement_from_input()
+
         self.physics_engine.update()
         self._update_player_texture(delta_time)
+        self._update_player_stealth()
+        self._update_enemies(delta_time)
         self.scroll_to_player()
 
+    def _update_enemies(self, delta_time):
+        """Level 1 enemy: chase only if player is visible (not hidden in bush)."""
+        if not self.enemy_list:
+            return
+        if self.current_level != 1:
+            return
+
+        if not self.player_sprite:
+            return
+
+        see_player = not self.player_hidden
+        if not see_player:
+            return
+
+        px, py = self.player_sprite.center_x, self.player_sprite.center_y
+        range2 = ENEMY_DETECTION_RANGE * ENEMY_DETECTION_RANGE
+
+        for enemy in self.enemy_list:
+            ex, ey = enemy.center_x, enemy.center_y
+            dx = px - ex
+            dy = py - ey
+            dist2 = dx * dx + dy * dy
+
+            if dist2 > range2 or dist2 == 0:
+                continue
+
+            dist = math.sqrt(dist2)
+            ux = dx / dist
+            uy = dy / dist
+
+            old_x, old_y = ex, ey
+            enemy.center_x = ex + ux * ENEMY_SPEED * delta_time
+            enemy.center_y = ey + uy * ENEMY_SPEED * delta_time
+
+            if len(arcade.check_for_collision_with_list(enemy, self.wall_list)) > 0:
+                enemy.center_x, enemy.center_y = old_x, old_y
+
     def scroll_to_player(self, immediate=False):
-        left_boundary = self.view_left + VIEWPORT_MARGIN
-        if self.player_sprite.left < left_boundary:
-            self.view_left -= left_boundary - self.player_sprite.left
+        """
+        Lock camera on player (player at screen center).
+        Same as arcade/examples/sprite_move_scrolling.py
+        """
+        w, h = self.window.width, self.window.height
+        target_left = self.player_sprite.center_x - w / 2
+        target_bottom = self.player_sprite.center_y - h / 2
 
-        right_boundary = self.view_left + self.window.width - VIEWPORT_MARGIN
-        if self.player_sprite.right > right_boundary:
-            self.view_left += self.player_sprite.right - right_boundary
+        max_view_left = max(0, self.map_pixel_width - w)
+        max_view_bottom = max(0, self.map_pixel_height - h)
 
-        top_boundary = self.view_bottom + self.window.height - VIEWPORT_MARGIN
-        if self.player_sprite.top > top_boundary:
-            self.view_bottom += self.player_sprite.top - top_boundary
+        self.view_left = max(0, min(target_left, max_view_left))
+        self.view_bottom = max(0, min(target_bottom, max_view_bottom))
 
-        bottom_boundary = self.view_bottom + VIEWPORT_MARGIN
-        if self.player_sprite.bottom < bottom_boundary:
-            self.view_bottom -= bottom_boundary - self.player_sprite.bottom
-
-        max_view_left = max(0, self.map_pixel_width - self.window.width)
-        max_view_bottom = max(0, self.map_pixel_height - self.window.height)
-        self.view_left = max(0, min(self.view_left, max_view_left))
-        self.view_bottom = max(0, min(self.view_bottom, max_view_bottom))
-
-        position = (self.view_left, self.view_bottom)
-        if immediate:
-            self.camera_sprites.move_to(position)
-        else:
-            self.camera_sprites.move_to(position, CAMERA_SPEED)
+        # Always snap (speed=1): player stays centered on screen.
+        self.camera_sprites.move_to(Vec2(self.view_left, self.view_bottom), 1.0)
 
     def on_resize(self, width, height):
         if self.camera_sprites:
             self.camera_sprites.resize(int(width), int(height))
+            self.camera_sprites.scale = 1.0
         if self.camera_gui:
             self.camera_gui.resize(int(width), int(height))
+
+
+class SaveSlotsView(arcade.View):
+    """
+    3-slot save/load screen.
+    - mode="new": pick a slot to start a new game (overwrites that slot on next save)
+    - mode="load": pick a slot to continue from (only enabled if slot has data)
+    """
+
+    def __init__(self, mode: str = "load"):
+        super().__init__()
+        self.mode = mode
+        self.selected_index = 0
+        self.hitboxes = []
+
+    def on_show_view(self):
+        arcade.set_background_color(COLOR_BG_TOP)
+        self.selected_index = 0
+
+    def _items(self, w, h):
+        cx = w / 2
+        base_y = h / 2 + 90
+        spacing = 74
+        bw = 560
+        bh = 56
+        items = []
+        for i in range(1, SAVE_SLOTS + 1):
+            summary = slot_summary(i)
+            has_data = summary is not None
+            enabled = True if self.mode == "new" else has_data
+            title = f"Slot {i}"
+            subtitle = (
+                f"Level {summary['level']}  |  {summary['map_file']}"
+                if has_data
+                else "Empty"
+            )
+            items.append(
+                {
+                    "slot": i,
+                    "cx": cx,
+                    "cy": base_y - (i - 1) * spacing,
+                    "bw": bw,
+                    "bh": bh,
+                    "enabled": enabled,
+                    "title": title,
+                    "subtitle": subtitle,
+                }
+            )
+        return items
+
+    def on_draw(self):
+        self.clear()
+        w = self.window.width
+        h = self.window.height
+
+        draw_vertical_gradient(w, h, COLOR_BG_TOP, COLOR_BG_BOTTOM)
+        panel_w = min(820, w * 0.82)
+        panel_h = min(520, h * 0.72)
+        draw_menu_frame(w / 2, h / 2, panel_w, panel_h)
+
+        heading = "Choose a Save Slot" if self.mode == "new" else "Continue — Choose Slot"
+        arcade.draw_text(
+            heading,
+            w / 2,
+            h / 2 + 190,
+            COLOR_GOLD,
+            font_size=40,
+            anchor_x="center",
+            bold=True,
+        )
+        hint = (
+            "Enter — Start new game in slot   |   Esc — Back"
+            if self.mode == "new"
+            else "Enter — Load slot   |   Esc — Back"
+        )
+        arcade.draw_text(
+            hint,
+            w / 2,
+            h / 2 - 210,
+            COLOR_TEXT_DIM,
+            font_size=15,
+            anchor_x="center",
+        )
+
+        self.hitboxes = []
+        for idx, it in enumerate(self._items(w, h)):
+            selected = idx == self.selected_index
+            enabled = it["enabled"]
+            cx, cy, bw, bh = it["cx"], it["cy"], it["bw"], it["bh"]
+
+            left = cx - bw / 2
+            bottom = cy - bh / 2
+            self.hitboxes.append((left, bottom, bw, bh, it["slot"], enabled))
+
+            if selected and enabled:
+                arcade.draw_rectangle_filled(cx, cy, bw + 10, bh + 10, (70, 55, 110))
+                arcade.draw_rectangle_outline(cx, cy, bw + 10, bh + 10, COLOR_GOLD, 3)
+            else:
+                fill = (45, 35, 75) if enabled else (32, 28, 46)
+                outline = COLOR_GOLD_DIM if enabled else COLOR_TEXT_DIM
+                arcade.draw_rectangle_filled(cx, cy, bw, bh, fill)
+                arcade.draw_rectangle_outline(cx, cy, bw, bh, outline, 2 if selected else 1)
+
+            title_color = COLOR_TEXT if enabled else COLOR_TEXT_DIM
+            sub_color = COLOR_TEXT_DIM if enabled else (120, 118, 135)
+            arcade.draw_text(
+                it["title"],
+                cx - bw / 2 + 18,
+                cy + 6,
+                title_color,
+                font_size=22,
+                anchor_x="left",
+                anchor_y="center",
+                bold=True,
+            )
+            arcade.draw_text(
+                it["subtitle"],
+                cx - bw / 2 + 18,
+                cy - 16,
+                sub_color,
+                font_size=14,
+                anchor_x="left",
+                anchor_y="center",
+            )
+
+    def _activate(self):
+        slot = self.selected_index + 1
+        if self.mode == "new":
+            self.window.show_view(GameView(saved_state=None, save_slot=slot))
+            return
+
+        saved = load_save_data(slot)
+        if saved:
+            self.window.show_view(GameView(saved_state=saved, save_slot=slot))
+
+    def _select_at_mouse(self, x, y):
+        for i, (left, bottom, bw, bh, slot, enabled) in enumerate(self.hitboxes):
+            if left <= x <= left + bw and bottom <= y <= bottom + bh:
+                self.selected_index = i
+                if enabled:
+                    self._activate()
+                return
+
+    def on_key_press(self, key, modifiers):
+        if key == arcade.key.UP:
+            self.selected_index = (self.selected_index - 1) % SAVE_SLOTS
+        elif key == arcade.key.DOWN:
+            self.selected_index = (self.selected_index + 1) % SAVE_SLOTS
+        elif key in (arcade.key.ENTER, arcade.key.SPACE):
+            enabled = self._items(self.window.width, self.window.height)[self.selected_index][
+                "enabled"
+            ]
+            if enabled:
+                self._activate()
+        elif key == arcade.key.ESCAPE:
+            self.window.show_view(MenuView())
+
+    def on_mouse_press(self, x, y, button, modifiers):
+        if button == arcade.MOUSE_BUTTON_LEFT:
+            self._select_at_mouse(x, y)
 
 
 def main():

@@ -1,0 +1,7 @@
+{
+  "level": 1,
+  "player_x": 80.0,
+  "player_y": 560.0,
+  "facing": "down",
+  "map_file": "level1.json"
+}
